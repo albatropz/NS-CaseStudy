@@ -1,0 +1,18 @@
+{
+  "name": "sample-ns-project",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "setup:netsuite": "suitecloud account:setup",
+    "validate": "suitecloud project:validate",
+    "deploy": "suitecloud project:deploy",
+    "upload": "node scripts/upload.js",
+    "create": "node scripts/create.js"
+  },
+  "devDependencies": {
+    "@oracle/suitecloud-cli": "^4.1.1"
+  },
+  "overrides": {
+    "commander": "14.0.2"
+  }
+}
