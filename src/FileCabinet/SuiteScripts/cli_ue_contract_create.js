@@ -4,10 +4,12 @@
  * @NScriptType UserEventScript
  */
 
-// CHANGED: Added N/record
 define(['N/error', 'N/record'], (error, record) => {
 
-    // Existing month calculation
+    // ==========================================
+    // MONTH CALCULATOR
+    // ==========================================
+
     const countMonths = (startDate, endDate) => {
         return (
             (endDate.getFullYear() - startDate.getFullYear()) * 12 +
@@ -15,7 +17,11 @@ define(['N/error', 'N/record'], (error, record) => {
         );
     };
 
-    // Shared billing schedule generator
+
+    // ==========================================
+    // SHARED BILLING SCHEDULE GENERATOR
+    // ==========================================
+
     function generateBillingSchedule(salesOrder) {
 
         const startDate = salesOrder.getValue({
@@ -40,7 +46,11 @@ define(['N/error', 'N/record'], (error, record) => {
 
         const netDays = Number(netDaysValue);
 
-        // Calculate monthly amount from Items
+
+        // ======================================
+        // CALCULATE MONTHLY RENTAL FROM ITEMS
+        // ======================================
+
         const lineCount = salesOrder.getLineCount({
             sublistId: 'item'
         });
@@ -58,7 +68,11 @@ define(['N/error', 'N/record'], (error, record) => {
             itemAmount += Number(amount) || 0;
         }
 
-        // Validate contract dates
+
+        // ======================================
+        // VALIDATE CONTRACT DATES
+        // ======================================
+
         if (!startDate || !endDate) {
             throw error.create({
                 name: 'MISSING_DATES',
@@ -84,7 +98,11 @@ define(['N/error', 'N/record'], (error, record) => {
 
         const months = countMonths(start, end);
 
-        // Determine billing frequency
+
+        // ======================================
+        // DETERMINE BILLING FREQUENCY
+        // ======================================
+
         let billingMonths;
 
         switch (String(paymentTerms)) {
@@ -113,7 +131,11 @@ define(['N/error', 'N/record'], (error, record) => {
                 });
         }
 
-        // Determine Billing Type
+
+        // ======================================
+        // DETERMINE BILLING TYPE
+        // ======================================
+
         let dueDateRule;
 
         switch (String(billingType)) {
@@ -138,7 +160,11 @@ define(['N/error', 'N/record'], (error, record) => {
                 });
         }
 
-        // Validate Net Days
+
+        // ======================================
+        // VALIDATE NET DAYS
+        // ======================================
+
         if (dueDateRule === 'NET_DAYS') {
 
             if (
@@ -156,7 +182,11 @@ define(['N/error', 'N/record'], (error, record) => {
             }
         }
 
-        // Shared due date calculation
+
+        // ======================================
+        // CALCULATE DUE DATE
+        // ======================================
+
         function calculateDueDate(periodStart, periodEnd) {
 
             let dueDate;
@@ -182,7 +212,11 @@ define(['N/error', 'N/record'], (error, record) => {
             return dueDate;
         }
 
-        // Generate all billing periods
+
+        // ======================================
+        // GENERATE ALL BILLING PERIODS
+        // ======================================
+
         const billingSchedule = [];
 
         for (
@@ -230,11 +264,14 @@ define(['N/error', 'N/record'], (error, record) => {
             });
         }
 
-        // NEW: Return results to both entry points
         return billingSchedule;
     }
 
-    // CHANGED: Simplified beforeSubmit
+
+    // ==========================================
+    // BEFORE SUBMIT
+    // ==========================================
+
     function beforeSubmit(context) {
 
         if (context.type !== context.UserEventType.CREATE) {
@@ -243,7 +280,6 @@ define(['N/error', 'N/record'], (error, record) => {
 
         const salesOrder = context.newRecord;
 
-        // Call shared generator
         const billingSchedule =
             generateBillingSchedule(salesOrder);
 
@@ -252,6 +288,72 @@ define(['N/error', 'N/record'], (error, record) => {
         }
 
         const firstPeriod = billingSchedule[0];
+
+
+        // ======================================
+        // NEW: GET CONTRACT DATES
+        // ======================================
+
+        const startDate = salesOrder.getValue({
+            fieldId: 'startdate'
+        });
+
+        const endDate = salesOrder.getValue({
+            fieldId: 'enddate'
+        });
+
+
+        // ======================================
+        // FIXED: CALCULATE CONTRACT DURATION
+        // ======================================
+
+        const contractMonths = countMonths(
+            new Date(startDate),
+            new Date(endDate)
+        );
+
+
+        // ======================================
+        // FIXED: CALCULATE TOTAL CONTRACT VALUE
+        // ======================================
+
+        const totalContractValue = billingSchedule.reduce(
+            (total, period) => total + period.billingAmount,
+            0
+        );
+
+
+        // ======================================
+        // FIXED: CALCULATE MONTHLY RENTAL
+        // ======================================
+
+        const monthlyRental =
+            totalContractValue / contractMonths;
+
+
+        // ======================================
+        // NEW: STORE FINANCIAL SUMMARY
+        // ======================================
+
+        salesOrder.setValue({
+            fieldId: 'custbody_cli_monthly_rental',
+            value: monthlyRental
+        });
+
+        salesOrder.setValue({
+            fieldId: 'custbody_cli_contract_months',
+            value: contractMonths
+        });
+
+        salesOrder.setValue({
+            fieldId: 'custbody_cli_contract_total',
+            value: totalContractValue
+        });
+
+
+        // ======================================
+        // EXISTING: STORE FIRST BILLING PERIOD
+        // ======================================
 
         salesOrder.setValue({
             fieldId: 'custbody_cli_billing_amount',
@@ -273,16 +375,28 @@ define(['N/error', 'N/record'], (error, record) => {
             value: firstPeriod.dueDate
         });
 
+
+        // ======================================
+        // AUDIT LOG
+        // ======================================
+
         log.audit({
             title: 'Contract Billing Validated',
             details: {
+                contractMonths: contractMonths,
+                monthlyRental: monthlyRental,
+                totalContractValue: totalContractValue,
                 totalPeriods: billingSchedule.length,
                 firstBillingAmount: firstPeriod.billingAmount
             }
         });
     }
 
-    // Create all billing schedule records
+
+    // ==========================================
+    // AFTER SUBMIT
+    // ==========================================
+
     function afterSubmit(context) {
 
         if (context.type !== context.UserEventType.CREATE) {
@@ -292,12 +406,14 @@ define(['N/error', 'N/record'], (error, record) => {
         const salesOrder = context.newRecord;
         const salesOrderId = salesOrder.id;
 
-        // Generate populated array
         const billingSchedule =
             generateBillingSchedule(salesOrder);
 
-        // Create a custom record for each billing period
-       
+
+        // ======================================
+        // CREATE ALL BILLING SCHEDULE RECORDS
+        // ======================================
+
         billingSchedule.forEach((period, index) => {
 
             const billingRecord = record.create({
@@ -305,7 +421,6 @@ define(['N/error', 'N/record'], (error, record) => {
                 isDynamic: false
             });
 
-            // Populate required Name field
             billingRecord.setValue({
                 fieldId: 'name',
                 value: `SO-${salesOrderId}-Period-${index + 1}`
@@ -354,6 +469,10 @@ define(['N/error', 'N/record'], (error, record) => {
         });
 
 
+        // ======================================
+        // FINAL AUDIT LOG
+        // ======================================
+
         log.audit({
             title: 'Billing Schedule Generated',
             details: {
@@ -367,6 +486,11 @@ define(['N/error', 'N/record'], (error, record) => {
             }
         });
     }
+
+
+    // ==========================================
+    // RETURN ENTRY POINTS
+    // ==========================================
 
     return {
         beforeSubmit,
