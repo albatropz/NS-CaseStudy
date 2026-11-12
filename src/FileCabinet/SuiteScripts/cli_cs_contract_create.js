@@ -7,13 +7,22 @@ define([], () => {
 
     const NET_DAYS_ID = '3';
 
-    // ADDED: Payment Terms to Unit mapping
     const UNIT_MAPPING = {
         'monthly': ['Month', 'mo'],
         'quarterly': ['Quarter', 'qrtr'],
         'semi-annual': ['Semi-Annual', 'smannl'],
         'annual': ['Year', 'yr']
     };
+
+    // ADDED: Number of months per billing period
+    const TERM_MONTHS = {
+        'monthly': 1,
+        'quarterly': 3,
+        'semi-annual': 6,
+        'annual': 12
+    };
+
+    let isUpdating = false;
 
     // ==========================================
     // NET DAYS FIELD
@@ -38,51 +47,169 @@ define([], () => {
     }
 
     // ==========================================
-    // COUNT CONTRACT MONTHS
+    // ADDED: NORMALIZE DATE
     // ==========================================
-    function countMonths(startDate, endDate) {
+    function normalizeDate(value) {
 
-        if (
-            !(startDate instanceof Date) ||
-            !(endDate instanceof Date) ||
-            isNaN(startDate.getTime()) ||
-            isNaN(endDate.getTime()) ||
-            endDate < startDate
-        ) {
-            return 0;
+        if (!(value instanceof Date)) {
+            return null;
         }
 
-        return (
-            (endDate.getFullYear() -
-                startDate.getFullYear()) * 12 +
-            endDate.getMonth() -
-            startDate.getMonth() + 1
+        if (isNaN(value.getTime())) {
+            return null;
+        }
+
+        return new Date(Date.UTC(
+            value.getFullYear(),
+            value.getMonth(),
+            value.getDate()
+        ));
+    }
+
+    // ==========================================
+    // ADDED: ADD CONTRACT MONTHS
+    // ==========================================
+    function addMonths(date, months) {
+
+        const year = date.getUTCFullYear();
+        const month = date.getUTCMonth() + months;
+        const day = date.getUTCDate();
+
+        const target = new Date(
+            Date.UTC(year, month, 1)
+        );
+
+        const lastDay = new Date(
+            Date.UTC(
+                target.getUTCFullYear(),
+                target.getUTCMonth() + 1,
+                0
+            )
+        ).getUTCDate();
+
+        target.setUTCDate(
+            Math.min(day, lastDay)
+        );
+
+        return target;
+    }
+
+    // ==========================================
+    // ADDED: COUNT DAYS
+    // ==========================================
+    function daysBetween(start, end) {
+
+        const DAY_MS = 24 * 60 * 60 * 1000;
+
+        return Math.round(
+            (end.getTime() - start.getTime()) /
+            DAY_MS
         );
     }
 
     // ==========================================
-    // ADDED: FIND UNIT VALUE
+    // CHANGED: CALCULATE BILLING QUANTITY
+    // ==========================================
+    function calculateQuantity(
+        startDate,
+        endDate,
+        termsText
+    ) {
+
+        const start = normalizeDate(startDate);
+        const end = normalizeDate(endDate);
+
+        if (!start || !end || end < start) {
+            return 0;
+        }
+
+        const term = String(
+            termsText || ''
+        ).trim().toLowerCase();
+
+        const periodMonths = TERM_MONTHS[term];
+
+        if (!periodMonths) {
+            console.log(
+                'Unsupported payment term:',
+                termsText
+            );
+            return null;
+        }
+
+        // Inclusive contract end date
+        const endExclusive = new Date(
+            end.getTime() + 86400000
+        );
+
+        let quantity = 0;
+        let periodIndex = 0;
+
+        while (periodIndex < 1200) {
+
+            const periodStart = addMonths(
+                start,
+                periodIndex * periodMonths
+            );
+
+            if (periodStart >= endExclusive) {
+                break;
+            }
+
+            const periodEnd = addMonths(
+                start,
+                (periodIndex + 1) * periodMonths
+            );
+
+            const actualEnd =
+                endExclusive < periodEnd
+                    ? endExclusive
+                    : periodEnd;
+
+            const consumedDays = daysBetween(
+                periodStart,
+                actualEnd
+            );
+
+            const fullPeriodDays = daysBetween(
+                periodStart,
+                periodEnd
+            );
+
+            if (fullPeriodDays <= 0) {
+                break;
+            }
+
+            quantity +=
+                consumedDays / fullPeriodDays;
+
+            periodIndex++;
+        }
+
+        // Round for NetSuite quantity display
+        return Number(quantity.toFixed(6));
+    }
+
+    // ==========================================
+    // FIND UNIT VALUE
     // ==========================================
     function findUnit(rec, termsText) {
 
         const mapping = UNIT_MAPPING[
-            String(termsText || '').trim().toLowerCase()
+            String(termsText || '')
+                .trim()
+                .toLowerCase()
         ];
 
-        if (!mapping) {
-            console.log('Unmapped payment terms:', termsText);
-            return null;
-        }
+        if (!mapping) return null;
 
-        const unitField = rec.getCurrentSublistField({
-            sublistId: 'item',
-            fieldId: 'units'
-        });
+        const unitField =
+            rec.getCurrentSublistField({
+                sublistId: 'item',
+                fieldId: 'units'
+            });
 
-        if (!unitField) {
-            console.log('Units field unavailable');
-            return null;
-        }
+        if (!unitField) return null;
 
         let options;
 
@@ -92,12 +219,14 @@ define([], () => {
                 operator: 'contains'
             });
         } catch (e) {
-            console.log('Cannot read unit options:', e);
+            console.log(
+                'Cannot read unit options:',
+                e
+            );
             return null;
         }
 
         if (!options || !options.length) {
-            console.log('No unit options returned');
             return null;
         }
 
@@ -105,32 +234,29 @@ define([], () => {
             value => value.toLowerCase()
         );
 
-        const selected = options.find(option =>
-            validNames.includes(
-                String(option.text || '').trim().toLowerCase()
+        const selected = options.find(
+            option => validNames.includes(
+                String(option.text || '')
+                    .trim()
+                    .toLowerCase()
             )
         );
 
-        if (!selected) {
-            console.log('Matching unit not found:', {
-                termsText,
-                options
-            });
-            return null;
-        }
-
-        return selected.value;
+        return selected
+            ? selected.value
+            : null;
     }
 
     // ==========================================
-    // CHANGED: POPULATE QUANTITY AND UNITS
+    // CHANGED: UPDATE QUANTITY AND UNITS
     // ==========================================
     function updateItemLine(rec) {
 
-        const itemId = rec.getCurrentSublistValue({
-            sublistId: 'item',
-            fieldId: 'item'
-        });
+        const itemId =
+            rec.getCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'item'
+            });
 
         if (!itemId) return;
 
@@ -142,28 +268,24 @@ define([], () => {
             fieldId: 'enddate'
         });
 
-        const months = countMonths(
-            startDate,
-            endDate
-        );
-
-        // Quantity depends on dates only
-        if (months > 0) {
-
-            rec.setCurrentSublistValue({
-                sublistId: 'item',
-                fieldId: 'quantity',
-                value: months,
-                ignoreFieldChange: false
-            });
-        }
-
         const termsText = rec.getText({
             fieldId: 'terms'
         });
 
-        const unitId = findUnit(rec, termsText);
+        const quantity = calculateQuantity(
+            startDate,
+            endDate,
+            termsText
+        );
 
+        if (quantity === null) return;
+
+        const unitId = findUnit(
+            rec,
+            termsText
+        );
+
+        // Update units first
         if (unitId !== null) {
 
             rec.setCurrentSublistValue({
@@ -172,36 +294,68 @@ define([], () => {
                 value: unitId,
                 ignoreFieldChange: true
             });
+        }
 
-            console.log('Units updated:', {
-                terms: termsText,
-                unitId: unitId,
-                quantity: months
+        // Then update quantity
+        if (quantity > 0) {
+
+            rec.setCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'quantity',
+                value: quantity,
+                ignoreFieldChange: false
             });
         }
+
+        console.log(
+            'Billing quantity updated:',
+            {
+                terms: termsText,
+                quantity: quantity,
+                unitId: unitId
+            }
+        );
     }
 
     // ==========================================
-    // ADDED: UPDATE EXISTING ITEM LINES
+    // UPDATE EXISTING ITEM LINES
     // ==========================================
     function updateExistingItemLines(rec) {
 
-        const lineCount = rec.getLineCount({
-            sublistId: 'item'
-        });
+        if (isUpdating) return;
 
-        for (let i = 0; i < lineCount; i++) {
+        isUpdating = true;
 
-            rec.selectLine({
-                sublistId: 'item',
-                line: i
-            });
+        try {
 
-            updateItemLine(rec);
-
-            rec.commitLine({
+            const lineCount = rec.getLineCount({
                 sublistId: 'item'
             });
+
+            for (let i = 0; i < lineCount; i++) {
+
+                rec.selectLine({
+                    sublistId: 'item',
+                    line: i
+                });
+
+                updateItemLine(rec);
+
+                rec.commitLine({
+                    sublistId: 'item'
+                });
+            }
+
+        } catch (e) {
+
+            console.error(
+                'Error updating item lines:',
+                e
+            );
+
+        } finally {
+
+            isUpdating = false;
         }
     }
 
@@ -210,7 +364,9 @@ define([], () => {
     // ==========================================
     function pageInit(context) {
 
-        updateNetDaysField(context.currentRecord);
+        updateNetDaysField(
+            context.currentRecord
+        );
     }
 
     // ==========================================
@@ -218,17 +374,19 @@ define([], () => {
     // ==========================================
     function fieldChanged(context) {
 
+        if (isUpdating) return;
+
         const rec = context.currentRecord;
 
         if (
             context.fieldId ===
             'custbody_cli_billing_type'
         ) {
+
             updateNetDaysField(rec);
             return;
         }
 
-        // CHANGED: React to terms and dates
         if (
             !context.sublistId &&
             (
@@ -237,6 +395,7 @@ define([], () => {
                 context.fieldId === 'enddate'
             )
         ) {
+
             updateExistingItemLines(rec);
         }
     }
@@ -246,11 +405,16 @@ define([], () => {
     // ==========================================
     function postSourcing(context) {
 
+        if (isUpdating) return;
+
         if (
             context.sublistId === 'item' &&
             context.fieldId === 'item'
         ) {
-            updateItemLine(context.currentRecord);
+
+            updateItemLine(
+                context.currentRecord
+            );
         }
     }
 

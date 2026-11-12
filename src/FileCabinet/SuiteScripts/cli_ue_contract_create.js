@@ -3,80 +3,180 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  */
-
 define(['N/error', 'N/record'], (error, record) => {
 
+    const round2 = value =>
+        Math.round((value + Number.EPSILON) * 100) / 100;
+
     // ==========================================
-    // MONTH CALCULATOR
+    // DATE HELPERS
     // ==========================================
 
-    const countMonths = (startDate, endDate) => {
-        return (
-            (endDate.getFullYear() - startDate.getFullYear()) * 12 +
-            (endDate.getMonth() - startDate.getMonth() + 1)
+    const addContractMonths = (date, months) => {
+
+        const result = new Date(
+            date.getFullYear(),
+            date.getMonth() + months,
+            1
         );
+
+        const lastDay = new Date(
+            result.getFullYear(),
+            result.getMonth() + 1,
+            0
+        ).getDate();
+
+        result.setDate(
+            Math.min(date.getDate(), lastDay)
+        );
+
+        return result;
     };
 
+    const addDays = (date, days) => {
+
+        const result = new Date(date);
+
+        result.setDate(
+            result.getDate() + days
+        );
+
+        return result;
+    };
+
+    const sameDate = (a, b) =>
+        a.getFullYear() === b.getFullYear() &&
+        a.getMonth() === b.getMonth() &&
+        a.getDate() === b.getDate();
+
+    const countDays = (start, end) => {
+
+        const a = Date.UTC(
+            start.getFullYear(),
+            start.getMonth(),
+            start.getDate()
+        );
+
+        const b = Date.UTC(
+            end.getFullYear(),
+            end.getMonth(),
+            end.getDate()
+        );
+
+        return Math.round(
+            (b - a) / 86400000
+        ) + 1;
+    };
+
+    const getEffectiveEndDate = (start, end) => {
+
+        const months =
+            (end.getFullYear() - start.getFullYear()) * 12 +
+            end.getMonth() - start.getMonth();
+
+        if (
+            months > 0 &&
+            sameDate(
+                addContractMonths(start, months),
+                end
+            )
+        ) {
+            return addDays(end, -1);
+        }
+
+        return new Date(end);
+    };
+
+    const countMonths = (start, effectiveEnd) => {
+
+        let months = 0;
+
+        while (
+            addContractMonths(start, months) <= effectiveEnd
+        ) {
+            months++;
+        }
+
+        return months;
+    };
 
     // ==========================================
-    // SHARED BILLING SCHEDULE GENERATOR
+    // PAYMENT TERMS HELPER
     // ==========================================
 
-    function generateBillingSchedule(salesOrder) {
+    const getBillingMonths = terms => {
 
-        const startDate = salesOrder.getValue({
-            fieldId: 'startdate'
-        });
+        switch (String(terms)) {
 
-        const endDate = salesOrder.getValue({
-            fieldId: 'enddate'
-        });
+            case '5':
+                return 1;  // Monthly
 
-        const paymentTerms = salesOrder.getValue({
-            fieldId: 'terms'
-        });
+            case '6':
+                return 3;  // Quarterly
 
-        const billingType = salesOrder.getValue({
-            fieldId: 'custbody_cli_billing_type'
-        });
+            case '4':
+                return 6;  // Semi-Annual
 
-        const netDaysValue = salesOrder.getValue({
-            fieldId: 'custbody_cli_net_days'
-        });
+            case '1':
+                return 12; // Annual
 
-        const netDays = Number(netDaysValue);
+            default:
+                throw error.create({
+                    name: 'INVALID_PAYMENT_TERMS',
+                    message: 'Unsupported payment terms.',
+                    notifyOff: false
+                });
+        }
+    };
 
+    // ==========================================
+    // READ MONTHLY ITEM RATES
+    // ==========================================
 
-        // ======================================
-        // CALCULATE MONTHLY RENTAL FROM ITEMS
-        // ======================================
+    const getMonthlyRates = (so, divisor) => {
 
-        const lineCount = salesOrder.getLineCount({
+        const rates = [];
+
+        const lineCount = so.getLineCount({
             sublistId: 'item'
         });
 
-        let itemAmount = 0;
-
         for (let i = 0; i < lineCount; i++) {
 
-            const amount = salesOrder.getSublistValue({
-                sublistId: 'item',
-                fieldId: 'amount',
-                line: i
-            });
+            const rate = Number(
+                so.getSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'rate',
+                    line: i
+                })
+            ) || 0;
 
-            itemAmount += Number(amount) || 0;
+            rates.push(rate / divisor);
         }
 
+        return rates;
+    };
 
-        // ======================================
-        // VALIDATE CONTRACT DATES
-        // ======================================
+    // ==========================================
+    // CHANGED: BILLING SCHEDULE GENERATOR
+    // ==========================================
+
+    function generateBillingSchedule(so, monthlyRental) {
+
+        const startDate = so.getValue({
+            fieldId: 'startdate'
+        });
+
+        const endDate = so.getValue({
+            fieldId: 'enddate'
+        });
 
         if (!startDate || !endDate) {
+
             throw error.create({
                 name: 'MISSING_DATES',
-                message: 'Contract start and end dates are required.',
+                message:
+                    'Contract start and end dates are required.',
                 notifyOff: false
             });
         }
@@ -89,184 +189,163 @@ define(['N/error', 'N/record'], (error, record) => {
             Number.isNaN(end.getTime()) ||
             end < start
         ) {
+
             throw error.create({
                 name: 'INVALID_DATE_RANGE',
-                message: 'Invalid contract date range.',
+                message: 'Invalid contract dates.',
                 notifyOff: false
             });
         }
 
-        const months = countMonths(start, end);
+        const effectiveEnd = getEffectiveEndDate(
+            start,
+            end
+        );
 
+        const billingMonths = getBillingMonths(
+            so.getValue({
+                fieldId: 'terms'
+            })
+        );
 
-        // ======================================
-        // DETERMINE BILLING FREQUENCY
-        // ======================================
+        const billingType = String(
+            so.getValue({
+                fieldId: 'custbody_cli_billing_type'
+            })
+        );
 
-        let billingMonths;
+        const netDaysValue = so.getValue({
+            fieldId: 'custbody_cli_net_days'
+        });
 
-        switch (String(paymentTerms)) {
+        const netDays = Number(netDaysValue);
 
-            case '5': // Monthly
-                billingMonths = 1;
-                break;
+        if (!['1', '2', '3'].includes(billingType)) {
 
-            case '6': // Quarterly
-                billingMonths = 3;
-                break;
-
-            case '4': // Semi-Annual
-                billingMonths = 6;
-                break;
-
-            case '1': // Annually
-                billingMonths = 12;
-                break;
-
-            default:
-                throw error.create({
-                    name: 'INVALID_PAYMENT_TERMS',
-                    message: 'Unsupported payment terms.',
-                    notifyOff: false
-                });
+            throw error.create({
+                name: 'INVALID_BILLING_TYPE',
+                message: 'Select a valid Billing Type.',
+                notifyOff: false
+            });
         }
 
-
-        // ======================================
-        // DETERMINE BILLING TYPE
-        // ======================================
-
-        let dueDateRule;
-
-        switch (String(billingType)) {
-
-            case '1':
-                dueDateRule = 'ADVANCE';
-                break;
-
-            case '2':
-                dueDateRule = 'ARREARS';
-                break;
-
-            case '3':
-                dueDateRule = 'NET_DAYS';
-                break;
-
-            default:
-                throw error.create({
-                    name: 'INVALID_BILLING_TYPE',
-                    message: 'Please select a valid Billing Type.',
-                    notifyOff: false
-                });
-        }
-
-
-        // ======================================
-        // VALIDATE NET DAYS
-        // ======================================
-
-        if (dueDateRule === 'NET_DAYS') {
-
-            if (
+        if (
+            billingType === '3' &&
+            (
                 netDaysValue === '' ||
-                netDaysValue === null ||
-                netDaysValue === undefined ||
+                netDaysValue == null ||
                 !Number.isInteger(netDays) ||
                 netDays <= 0
-            ) {
-                throw error.create({
-                    name: 'INVALID_NET_DAYS',
-                    message: 'Net Days must be a positive whole number.',
-                    notifyOff: false
-                });
-            }
+            )
+        ) {
+
+            throw error.create({
+                name: 'INVALID_NET_DAYS',
+                message:
+                    'Net Days must be a positive whole number.',
+                notifyOff: false
+            });
         }
 
+        const schedule = [];
 
-        // ======================================
-        // CALCULATE DUE DATE
-        // ======================================
+        // Rate for one complete billing period
+        const termRate =
+            monthlyRental * billingMonths;
 
-        function calculateDueDate(periodStart, periodEnd) {
-
-            let dueDate;
-
-            switch (dueDateRule) {
-
-                case 'ADVANCE':
-                    dueDate = new Date(periodStart);
-                    break;
-
-                case 'ARREARS':
-                    dueDate = new Date(periodEnd);
-                    break;
-
-                case 'NET_DAYS':
-                    dueDate = new Date(periodStart);
-                    dueDate.setDate(
-                        dueDate.getDate() + netDays
-                    );
-                    break;
-            }
-
-            return dueDate;
-        }
-
-
-        // ======================================
-        // GENERATE ALL BILLING PERIODS
-        // ======================================
-
-        const billingSchedule = [];
-
+        // Generate contract-based billing periods
         for (
             let i = 0;
-            i < months;
+            addContractMonths(start, i) <= effectiveEnd;
             i += billingMonths
         ) {
 
-            const periodStart = i === 0
-                ? new Date(start)
-                : new Date(
-                    start.getFullYear(),
-                    start.getMonth() + i,
-                    1
-                );
-
-            const periodEnd = new Date(
-                start.getFullYear(),
-                start.getMonth() + i + billingMonths,
-                0
+            const periodStart = addContractMonths(
+                start,
+                i
             );
 
-            const actualEnd =
-                periodEnd > end ? new Date(end) : periodEnd;
-
-            const monthsInPeriod = Math.min(
-                billingMonths,
-                months - i
+            const fullPeriodEnd = addDays(
+                addContractMonths(
+                    start,
+                    i + billingMonths
+                ),
+                -1
             );
 
-            const billingAmount =
-                itemAmount * monthsInPeriod;
+            const periodEnd =
+                fullPeriodEnd > effectiveEnd
+                    ? new Date(effectiveEnd)
+                    : fullPeriodEnd;
 
-            const dueDate = calculateDueDate(
+            // ======================================
+            // CHANGED: DAY-BASED QUANTITY
+            // ======================================
+
+            const consumedDays = countDays(
                 periodStart,
-                actualEnd
+                periodEnd
             );
 
-            billingSchedule.push({
-                periodNumber: billingSchedule.length + 1,
+            const totalPeriodDays = countDays(
+                periodStart,
+                fullPeriodEnd
+            );
+
+            const quantity =
+                consumedDays / totalPeriodDays;
+
+            // ======================================
+            // CHANGED: BILLING AMOUNT
+            // ======================================
+
+            const billingAmount = round2(
+                quantity * termRate
+            );
+
+            // ======================================
+            // DUE DATE
+            // ======================================
+
+            let dueDate;
+
+            if (billingType === '1') {
+
+                // Advance billing
+                dueDate = new Date(periodStart);
+
+            } else if (billingType === '2') {
+
+                // Arrears billing
+                dueDate = new Date(periodEnd);
+
+            } else {
+
+                // Net Days billing
+                dueDate = addDays(
+                    periodStart,
+                    netDays
+                );
+            }
+
+            schedule.push({
+
+                periodNumber: schedule.length + 1,
+
                 periodFrom: periodStart,
-                periodTo: actualEnd,
+
+                periodTo: periodEnd,
+
                 billingAmount: billingAmount,
+
+                quantity: quantity,
+
                 dueDate: dueDate
             });
         }
 
-        return billingSchedule;
+        return schedule;
     }
-
 
     // ==========================================
     // BEFORE SUBMIT
@@ -274,124 +353,191 @@ define(['N/error', 'N/record'], (error, record) => {
 
     function beforeSubmit(context) {
 
-        if (context.type !== context.UserEventType.CREATE) {
+        if (
+            context.type !==
+            context.UserEventType.CREATE
+        ) {
             return;
         }
 
-        const salesOrder = context.newRecord;
+        const so = context.newRecord;
 
-        const billingSchedule =
-            generateBillingSchedule(salesOrder);
-
-        if (billingSchedule.length === 0) {
-            return;
-        }
-
-        const firstPeriod = billingSchedule[0];
-
-
-        // ======================================
-        // NEW: GET CONTRACT DATES
-        // ======================================
-
-        const startDate = salesOrder.getValue({
-            fieldId: 'startdate'
-        });
-
-        const endDate = salesOrder.getValue({
-            fieldId: 'enddate'
-        });
-
-
-        // ======================================
-        // FIXED: CALCULATE CONTRACT DURATION
-        // ======================================
-
-        const contractMonths = countMonths(
-            new Date(startDate),
-            new Date(endDate)
+        const billingMonths = getBillingMonths(
+            so.getValue({
+                fieldId: 'terms'
+            })
         );
 
+        // On CREATE, entered rates are monthly rates
+        const monthlyRates = getMonthlyRates(
+            so,
+            1
+        );
 
-        // ======================================
-        // FIXED: CALCULATE TOTAL CONTRACT VALUE
-        // ======================================
-
-        const totalContractValue = billingSchedule.reduce(
-            (total, period) => total + period.billingAmount,
+        const monthlyRental = monthlyRates.reduce(
+            (sum, rate) => sum + rate,
             0
         );
 
+        const schedule = generateBillingSchedule(
+            so,
+            monthlyRental
+        );
+
+        if (!schedule.length) return;
 
         // ======================================
-        // FIXED: CALCULATE MONTHLY RENTAL
+        // TOTAL QUANTITY
         // ======================================
 
-        const monthlyRental =
-            totalContractValue / contractMonths;
-
+        const totalQuantity = schedule.reduce(
+            (sum, period) =>
+                sum + period.quantity,
+            0
+        );
 
         // ======================================
-        // NEW: STORE FINANCIAL SUMMARY
+        // TOTAL CONTRACT AMOUNT
         // ======================================
 
-        salesOrder.setValue({
+        const totalContractValue = round2(
+            schedule.reduce(
+                (sum, period) =>
+                    sum + period.billingAmount,
+                0
+            )
+        );
+
+        // ======================================
+        // UPDATE SALES ORDER ITEM LINES
+        // ======================================
+
+        let allocatedAmount = 0;
+
+        for (
+            let i = 0;
+            i < monthlyRates.length;
+            i++
+        ) {
+
+            const monthlyRate = monthlyRates[i];
+
+            const termRate =
+                monthlyRate * billingMonths;
+
+            const lineAmount =
+                i === monthlyRates.length - 1
+                    ? round2(
+                        totalContractValue -
+                        allocatedAmount
+                    )
+                    : round2(
+                        monthlyRental
+                            ? totalContractValue *
+                              monthlyRate /
+                              monthlyRental
+                            : 0
+                    );
+
+            allocatedAmount += lineAmount;
+
+            // CHANGED: Total prorated quantity
+            so.setSublistValue({
+                sublistId: 'item',
+                fieldId: 'quantity',
+                line: i,
+                value: Math.round(
+                    totalQuantity * 1e10
+                ) / 1e10
+            });
+
+            // Rate based on payment terms
+            so.setSublistValue({
+                sublistId: 'item',
+                fieldId: 'rate',
+                line: i,
+                value: termRate
+            });
+
+            // Total contract amount per item
+            so.setSublistValue({
+                sublistId: 'item',
+                fieldId: 'amount',
+                line: i,
+                value: lineAmount
+            });
+        }
+
+        // ======================================
+        // FINANCIAL SUMMARY FIELDS
+        // ======================================
+
+        const start = new Date(
+            so.getValue({
+                fieldId: 'startdate'
+            })
+        );
+
+        const effectiveEnd = getEffectiveEndDate(
+            start,
+            new Date(
+                so.getValue({
+                    fieldId: 'enddate'
+                })
+            )
+        );
+
+        const first = schedule[0];
+
+        so.setValue({
             fieldId: 'custbody_cli_monthly_rental',
             value: monthlyRental
         });
 
-        salesOrder.setValue({
+        so.setValue({
             fieldId: 'custbody_cli_contract_months',
-            value: contractMonths
+            value: countMonths(
+                start,
+                effectiveEnd
+            )
         });
 
-        salesOrder.setValue({
+        so.setValue({
             fieldId: 'custbody_cli_contract_total',
             value: totalContractValue
         });
 
-
-        // ======================================
-        // EXISTING: STORE FIRST BILLING PERIOD
-        // ======================================
-
-        salesOrder.setValue({
+        so.setValue({
             fieldId: 'custbody_cli_billing_amount',
-            value: firstPeriod.billingAmount
+            value: first.billingAmount
         });
 
-        salesOrder.setValue({
+        so.setValue({
             fieldId: 'custbody_cli_covered_period_from',
-            value: firstPeriod.periodFrom
+            value: first.periodFrom
         });
 
-        salesOrder.setValue({
+        so.setValue({
             fieldId: 'custbody_cli_covered_period_to',
-            value: firstPeriod.periodTo
+            value: first.periodTo
         });
 
-        salesOrder.setValue({
+        so.setValue({
             fieldId: 'custbody_cli_due_date',
-            value: firstPeriod.dueDate
+            value: first.dueDate
         });
-
-
-        // ======================================
-        // AUDIT LOG
-        // ======================================
 
         log.audit({
             title: 'Contract Billing Validated',
             details: {
-                contractMonths: contractMonths,
-                monthlyRental: monthlyRental,
-                totalContractValue: totalContractValue,
-                totalPeriods: billingSchedule.length,
-                firstBillingAmount: firstPeriod.billingAmount
+                monthlyRental,
+                billingMonths,
+                totalQuantity,
+                totalContractValue,
+                periods: schedule.length
             }
         });
     }
-
 
     // ==========================================
     // AFTER SUBMIT
@@ -399,102 +545,131 @@ define(['N/error', 'N/record'], (error, record) => {
 
     function afterSubmit(context) {
 
-        if (context.type !== context.UserEventType.CREATE) {
+        if (
+            context.type !==
+            context.UserEventType.CREATE
+        ) {
             return;
         }
 
-        const salesOrder = context.newRecord;
-        const salesOrderId = salesOrder.id;
+        const so = context.newRecord;
+        const soId = so.id;
 
-        const billingSchedule =
-            generateBillingSchedule(salesOrder);
+        const billingMonths = getBillingMonths(
+            so.getValue({
+                fieldId: 'terms'
+            })
+        );
 
+        // Saved item rates are term-based
+        // Convert back to monthly rates
+        const monthlyRates = getMonthlyRates(
+            so,
+            billingMonths
+        );
+
+        const monthlyRental = monthlyRates.reduce(
+            (sum, rate) => sum + rate,
+            0
+        );
+
+        const schedule = generateBillingSchedule(
+            so,
+            monthlyRental
+        );
 
         // ======================================
-        // CREATE ALL BILLING SCHEDULE RECORDS
+        // CREATE SUCCEEDING BILLING RECORDS
         // ======================================
 
-        billingSchedule.forEach((period, index) => {
+        schedule.forEach((period, index) => {
 
-            const billingRecord = record.create({
-                type: 'customrecord_cli_billing_schedule',
+            const bill = record.create({
+                type:
+                    'customrecord_cli_billing_schedule',
                 isDynamic: false
             });
 
-            billingRecord.setValue({
+            bill.setValue({
                 fieldId: 'name',
-                value: `SO-${salesOrderId}-Period-${index + 1}`
+                value:
+                    `SO-${soId}-Period-${index + 1}`
             });
 
-            billingRecord.setValue({
-                fieldId: 'custrecord_cli_bs_sales_order',
-                value: Number(salesOrderId)
+            bill.setValue({
+                fieldId:
+                    'custrecord_cli_bs_sales_order',
+                value: Number(soId)
             });
 
-            billingRecord.setValue({
-                fieldId: 'custrecord_cli_bs_period',
+            bill.setValue({
+                fieldId:
+                    'custrecord_cli_bs_period',
                 value: period.periodNumber
             });
 
-            billingRecord.setValue({
-                fieldId: 'custrecord_cli_bs_from',
+            bill.setValue({
+                fieldId:
+                    'custrecord_cli_bs_from',
                 value: period.periodFrom
             });
 
-            billingRecord.setValue({
-                fieldId: 'custrecord_cli_bs_to',
+            bill.setValue({
+                fieldId:
+                    'custrecord_cli_bs_to',
                 value: period.periodTo
             });
 
-            billingRecord.setValue({
-                fieldId: 'custrecord_cli_bs_amount',
+            bill.setValue({
+                fieldId:
+                    'custrecord_cli_bs_amount',
                 value: period.billingAmount
             });
 
-            billingRecord.setValue({
-                fieldId: 'custrecord_cli_bs_due_date',
+            bill.setValue({
+                fieldId:
+                    'custrecord_cli_bs_due_date',
                 value: period.dueDate
             });
 
-            const billingRecordId = billingRecord.save();
+            bill.setValue({
+                fieldId:
+                    'custrecord_cli_quantity',
+                value: period.quantity
+            });
+
+            const billId = bill.save();
 
             log.debug({
                 title: 'Billing Period Created',
                 details: {
-                    salesOrderId: salesOrderId,
-                    billingRecordId: billingRecordId,
-                    period: index + 1
+                    salesOrderId: soId,
+                    billingRecordId: billId,
+                    period: period.periodNumber,
+                    amount: period.billingAmount,
+                    quantity: period.quantity
                 }
             });
         });
 
-
-        // ======================================
-        // FINAL AUDIT LOG
-        // ======================================
-
         log.audit({
             title: 'Billing Schedule Generated',
             details: {
-                salesOrderId: salesOrderId,
-                totalPeriods: billingSchedule.length,
-                totalAmount: billingSchedule.reduce(
-                    (total, period) =>
-                        total + period.billingAmount,
-                    0
+                salesOrderId: soId,
+                periods: schedule.length,
+                totalAmount: round2(
+                    schedule.reduce(
+                        (sum, p) =>
+                            sum + p.billingAmount,
+                        0
+                    )
                 )
             }
         });
     }
 
-
-    // ==========================================
-    // RETURN ENTRY POINTS
-    // ==========================================
-
     return {
         beforeSubmit,
         afterSubmit
     };
-
 });
