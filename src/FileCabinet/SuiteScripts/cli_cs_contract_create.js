@@ -1,9 +1,23 @@
-
 /**
  * @NApiVersion 2.1
  * @NScriptType ClientScript
+ *
+ * File:      cli_cs_contract_create.js
+ * Name:      CLI Contract Create CS
+ * Script ID: customscript_cli_cs_contract_create
+ *
+ * Runs in the browser while the Sales Order (lease contract) is being filled in.
+ *  - Shows or hides Net Days based on Billing Type
+ *  - Sets item Units and a preview Quantity from the Payment Terms and dates
+ *
+ * The saved values always come from the user event scripts
+ * (cli_ue_contract_create.js / cli_ue_billing_update.js).
+ * The quantity preview here uses the SAME contract-month rule as
+ * cli_lib_billing.js so the number does not jump after saving.
+ *
+ * N/log in a client script writes to the browser console (F12).
  */
-define([], () => {
+define(['N/log'], (log) => {
 
     const NET_DAYS_ID = '3';
 
@@ -14,7 +28,7 @@ define([], () => {
         'annual': ['Year', 'yr']
     };
 
-    // ADDED: Number of months per billing period
+    // Number of months per billing period
     const TERM_MONTHS = {
         'monthly': 1,
         'quarterly': 3,
@@ -22,6 +36,9 @@ define([], () => {
         'annual': 12
     };
 
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    // Guards against our own updates re-triggering field events
     let isUpdating = false;
 
     // ==========================================
@@ -47,7 +64,7 @@ define([], () => {
     }
 
     // ==========================================
-    // ADDED: NORMALIZE DATE
+    // NORMALIZE DATE
     // ==========================================
     function normalizeDate(value) {
 
@@ -67,7 +84,8 @@ define([], () => {
     }
 
     // ==========================================
-    // ADDED: ADD CONTRACT MONTHS
+    // ADD CONTRACT MONTHS
+    // Same day-of-month N months later, clamped to month end
     // ==========================================
     function addMonths(date, months) {
 
@@ -95,20 +113,43 @@ define([], () => {
     }
 
     // ==========================================
-    // ADDED: COUNT DAYS
+    // INCLUSIVE DAY COUNT (start and end both counted)
     // ==========================================
-    function daysBetween(start, end) {
-
-        const DAY_MS = 24 * 60 * 60 * 1000;
+    function countDays(start, end) {
 
         return Math.round(
             (end.getTime() - start.getTime()) /
             DAY_MS
-        );
+        ) + 1;
     }
 
     // ==========================================
-    // CHANGED: CALCULATE BILLING QUANTITY
+    // EFFECTIVE END DATE (matches the server rule)
+    // If the end date falls exactly on a contract anniversary
+    // (e.g. 1/1/2026 to 1/1/2027), the last covered day is the day before.
+    // ==========================================
+    function getEffectiveEndDate(start, end) {
+
+        const months =
+            (end.getUTCFullYear() - start.getUTCFullYear()) * 12 +
+            end.getUTCMonth() - start.getUTCMonth();
+
+        if (
+            months > 0 &&
+            addMonths(start, months).getTime() === end.getTime()
+        ) {
+            return new Date(end.getTime() - DAY_MS);
+        }
+
+        return end;
+    }
+
+    // ==========================================
+    // CHANGED: CALCULATE PREVIEW QUANTITY
+    // Same contract-month rule as cli_lib_billing.js:
+    //  - a full contract month counts as 1
+    //  - a partial month counts as coveredDays / that month's own days
+    //  - quantity = total months / months per billing period (5 decimals)
     // ==========================================
     function calculateQuantity(
         startDate,
@@ -129,65 +170,52 @@ define([], () => {
 
         const periodMonths = TERM_MONTHS[term];
 
+        // Terms not selected yet (or unsupported): nothing to calculate
         if (!periodMonths) {
-            console.log(
-                'Unsupported payment term:',
-                termsText
-            );
+            log.debug('calculateQuantity: terms not ready', termsText);
             return null;
         }
 
-        // Inclusive contract end date
-        const endExclusive = new Date(
-            end.getTime() + 86400000
-        );
+        const effectiveEnd = getEffectiveEndDate(start, end);
 
-        let quantity = 0;
-        let periodIndex = 0;
+        let totalMonths = 0;
 
-        while (periodIndex < 1200) {
+        for (
+            let m = 0;
+            m < 1200 && addMonths(start, m) <= effectiveEnd;
+            m++
+        ) {
 
-            const periodStart = addMonths(
-                start,
-                periodIndex * periodMonths
+            const monthStart = addMonths(start, m);
+
+            // Last day of this contract month (day before the next anniversary)
+            const monthEnd = new Date(
+                addMonths(start, m + 1).getTime() - DAY_MS
             );
 
-            if (periodStart >= endExclusive) {
-                break;
-            }
+            const coveredEnd =
+                monthEnd < effectiveEnd
+                    ? monthEnd
+                    : effectiveEnd;
 
-            const periodEnd = addMonths(
-                start,
-                (periodIndex + 1) * periodMonths
-            );
-
-            const actualEnd =
-                endExclusive < periodEnd
-                    ? endExclusive
-                    : periodEnd;
-
-            const consumedDays = daysBetween(
-                periodStart,
-                actualEnd
-            );
-
-            const fullPeriodDays = daysBetween(
-                periodStart,
-                periodEnd
-            );
-
-            if (fullPeriodDays <= 0) {
-                break;
-            }
-
-            quantity +=
-                consumedDays / fullPeriodDays;
-
-            periodIndex++;
+            totalMonths +=
+                countDays(monthStart, coveredEnd) /
+                countDays(monthStart, monthEnd);
         }
 
-        // Round for NetSuite quantity display
-        return Number(quantity.toFixed(6));
+        // NetSuite keeps 5 decimals on item quantity
+        const quantity = Math.round(
+            (totalMonths / periodMonths + Number.EPSILON) * 1e5
+        ) / 1e5;
+
+        log.debug('calculateQuantity', {
+            terms: termsText,
+            effectiveEnd: effectiveEnd.toISOString(),
+            totalMonths,
+            quantity
+        });
+
+        return quantity;
     }
 
     // ==========================================
@@ -219,14 +247,13 @@ define([], () => {
                 operator: 'contains'
             });
         } catch (e) {
-            console.log(
-                'Cannot read unit options:',
-                e
-            );
+            log.error('findUnit: cannot read unit options', e);
             return null;
         }
 
+        // Options not loaded yet (e.g. item just picked)
         if (!options || !options.length) {
+            log.error('findUnit: no unit options loaded', { termsText });
             return null;
         }
 
@@ -242,13 +269,21 @@ define([], () => {
             )
         );
 
-        return selected
-            ? selected.value
-            : null;
+        // Shows what NetSuite really offers so UNIT_MAPPING can be fixed
+        if (!selected) {
+            log.error('findUnit: no matching unit', {
+                termsText,
+                wanted: validNames,
+                available: options.map(o => o.text)
+            });
+            return null;
+        }
+
+        return selected.value;
     }
 
     // ==========================================
-    // CHANGED: UPDATE QUANTITY AND UNITS
+    // UPDATE QUANTITY AND UNITS ON THE CURRENT LINE
     // ==========================================
     function updateItemLine(rec) {
 
@@ -307,18 +342,16 @@ define([], () => {
             });
         }
 
-        console.log(
-            'Billing quantity updated:',
-            {
-                terms: termsText,
-                quantity: quantity,
-                unitId: unitId
-            }
-        );
+        log.debug('Item line updated', {
+            terms: termsText,
+            quantity: quantity,
+            unitId: unitId
+        });
     }
 
     // ==========================================
     // UPDATE EXISTING ITEM LINES
+    // Runs when Terms, Start Date or End Date change
     // ==========================================
     function updateExistingItemLines(rec) {
 
@@ -348,10 +381,7 @@ define([], () => {
 
         } catch (e) {
 
-            console.error(
-                'Error updating item lines:',
-                e
-            );
+            log.error('Error updating item lines', e);
 
         } finally {
 
@@ -402,6 +432,8 @@ define([], () => {
 
     // ==========================================
     // POST SOURCING
+    // Runs when an item is picked. Terms may not be set yet,
+    // so validateLine below repeats the update before the line is added.
     // ==========================================
     function postSourcing(context) {
 
@@ -418,9 +450,52 @@ define([], () => {
         }
     }
 
+    // ==========================================
+    // ADDED: VALIDATE LINE
+    // Runs right before a line is committed (Add / OK).
+    // By then Terms, dates and the unit list are ready, so the result
+    // does not depend on the order the form was filled in.
+    // ==========================================
+    function validateLine(context) {
+
+        // Ignore the commits made by our own loop in updateExistingItemLines
+        if (isUpdating) return true;
+
+        if (context.sublistId !== 'item') return true;
+
+        isUpdating = true;
+
+        try {
+
+            updateItemLine(context.currentRecord);
+
+            log.debug('validateLine: units and quantity refreshed', {
+                terms: context.currentRecord.getText({
+                    fieldId: 'terms'
+                }),
+                units: context.currentRecord.getCurrentSublistText({
+                    sublistId: 'item',
+                    fieldId: 'units'
+                })
+            });
+
+        } catch (e) {
+
+            // The preview must never block the user from adding a line
+            log.error('validateLine failed', e);
+
+        } finally {
+
+            isUpdating = false;
+        }
+
+        return true;
+    }
+
     return {
         pageInit,
         fieldChanged,
-        postSourcing
+        postSourcing,
+        validateLine
     };
 });
