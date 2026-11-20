@@ -15,6 +15,13 @@
  * The quantity preview here uses the SAME contract-month rule as
  * cli_lib_billing.js so the number does not jump after saving.
  *
+ * Behavior:
+ *  - No Payment Terms yet: quantity is shown in months and units default to Month.
+ *  - Once Payment Terms are picked, quantity and units follow them right away,
+ *    on the line being edited AND on lines already added.
+ *  - On create, the line Amount previews the contract amount (monthly rate x
+ *    total months), which is the same at every Payment Terms.
+ *
  * N/log in a client script writes to the browser console (F12).
  */
 define(['N/log'], (log) => {
@@ -36,10 +43,20 @@ define(['N/log'], (log) => {
         'annual': 12
     };
 
+    // Used while no Payment Terms are selected: show quantity in months
+    const DEFAULT_TERM = 'monthly';
+
     const DAY_MS = 24 * 60 * 60 * 1000;
 
     // Guards against our own updates re-triggering field events
     let isUpdating = false;
+
+    // True when added lines still need a refresh (see refreshLines)
+    let refreshPending = false;
+
+    // Page mode (create / edit / copy), set in pageInit.
+    // The amount preview only applies on create, where the typed rate is MONTHLY.
+    let pageMode = '';
 
     // ==========================================
     // NET DAYS FIELD
@@ -145,35 +162,18 @@ define(['N/log'], (log) => {
     }
 
     // ==========================================
-    // CHANGED: CALCULATE PREVIEW QUANTITY
+    // TOTAL CONTRACT MONTHS (unrounded)
     // Same contract-month rule as cli_lib_billing.js:
     //  - a full contract month counts as 1
     //  - a partial month counts as coveredDays / that month's own days
-    //  - quantity = total months / months per billing period (5 decimals)
     // ==========================================
-    function calculateQuantity(
-        startDate,
-        endDate,
-        termsText
-    ) {
+    function calculateTotalMonths(startDate, endDate) {
 
         const start = normalizeDate(startDate);
         const end = normalizeDate(endDate);
 
         if (!start || !end || end < start) {
             return 0;
-        }
-
-        const term = String(
-            termsText || ''
-        ).trim().toLowerCase();
-
-        const periodMonths = TERM_MONTHS[term];
-
-        // Terms not selected yet (or unsupported): nothing to calculate
-        if (!periodMonths) {
-            log.debug('calculateQuantity: terms not ready', termsText);
-            return null;
         }
 
         const effectiveEnd = getEffectiveEndDate(start, end);
@@ -203,6 +203,38 @@ define(['N/log'], (log) => {
                 countDays(monthStart, monthEnd);
         }
 
+        return totalMonths;
+    }
+
+    // ==========================================
+    // CALCULATE PREVIEW QUANTITY
+    // quantity = total months / months per billing period (5 decimals)
+    // ==========================================
+    function calculateQuantity(
+        startDate,
+        endDate,
+        termsText
+    ) {
+
+        const totalMonths = calculateTotalMonths(startDate, endDate);
+
+        if (!totalMonths) {
+            return 0;
+        }
+
+        // No Payment Terms yet: fall back to months so the user still sees a value
+        const term = String(
+            termsText || ''
+        ).trim().toLowerCase() || DEFAULT_TERM;
+
+        const periodMonths = TERM_MONTHS[term];
+
+        // Unsupported Payment Terms: nothing to calculate
+        if (!periodMonths) {
+            log.debug('calculateQuantity: terms not ready', termsText);
+            return null;
+        }
+
         // NetSuite keeps 5 decimals on item quantity
         const quantity = Math.round(
             (totalMonths / periodMonths + Number.EPSILON) * 1e5
@@ -210,7 +242,6 @@ define(['N/log'], (log) => {
 
         log.debug('calculateQuantity', {
             terms: termsText,
-            effectiveEnd: effectiveEnd.toISOString(),
             totalMonths,
             quantity
         });
@@ -219,14 +250,64 @@ define(['N/log'], (log) => {
     }
 
     // ==========================================
+    // ADDED: PREVIEW AMOUNT (create only)
+    // On CREATE the typed rate is the MONTHLY rate, and the server turns it
+    // into the term rate on save. The contract amount is the same at any
+    // Payment Terms: monthly rate x total contract months.
+    // The rate is NOT changed here (the server still needs the monthly rate).
+    // ignoreFieldChange stops NetSuite from recalculating the rate from the amount.
+    // ==========================================
+    function previewAmount(rec, startDate, endDate) {
+
+        if (pageMode !== 'create') return;
+
+        try {
+
+            const monthlyRate = Number(
+                rec.getCurrentSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'rate'
+                })
+            ) || 0;
+
+            const totalMonths = calculateTotalMonths(startDate, endDate);
+
+            if (!monthlyRate || !totalMonths) return;
+
+            const amount = Math.round(
+                (monthlyRate * totalMonths + Number.EPSILON) * 100
+            ) / 100;
+
+            rec.setCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'amount',
+                value: amount,
+                ignoreFieldChange: true
+            });
+
+            log.debug('previewAmount', {
+                monthlyRate,
+                totalMonths,
+                amount
+            });
+
+        } catch (e) {
+
+            // The preview must never block the user
+            log.error('previewAmount failed', e);
+        }
+    }
+
+    // ==========================================
     // FIND UNIT VALUE
     // ==========================================
     function findUnit(rec, termsText) {
 
+        // No Payment Terms yet: default the unit to Month
         const mapping = UNIT_MAPPING[
             String(termsText || '')
                 .trim()
-                .toLowerCase()
+                .toLowerCase() || DEFAULT_TERM
         ];
 
         if (!mapping) return null;
@@ -342,6 +423,11 @@ define(['N/log'], (log) => {
             });
         }
 
+        // Amount last, so it is not overwritten by the quantity recalculation
+        if (quantity > 0) {
+            previewAmount(rec, startDate, endDate);
+        }
+
         log.debug('Item line updated', {
             terms: termsText,
             quantity: quantity,
@@ -390,9 +476,85 @@ define(['N/log'], (log) => {
     }
 
     // ==========================================
+    // ADDED: REFRESH LINES (Terms / dates changed)
+    // 1. A line being edited (item picked, not added yet) is updated in place.
+    // 2. Selecting another line could discard that unfinished line, so lines
+    //    already added are refreshed right after the user adds it
+    //    (see sublistChanged). If there is no unfinished line, they refresh now.
+    // ==========================================
+    function refreshLines(rec) {
+
+        if (isUpdating) return;
+
+        const editingItem = rec.getCurrentSublistValue({
+            sublistId: 'item',
+            fieldId: 'item'
+        });
+
+        if (!editingItem) {
+
+            refreshPending = false;
+            updateExistingItemLines(rec);
+            return;
+        }
+
+        isUpdating = true;
+
+        try {
+
+            updateItemLine(rec);
+
+            // Added lines (if any) still show the old terms
+            refreshPending = rec.getLineCount({
+                sublistId: 'item'
+            }) > 0;
+
+            log.debug('refreshLines: editing line updated', {
+                refreshPending: refreshPending
+            });
+
+        } catch (e) {
+
+            log.error('refreshLines failed', e);
+
+        } finally {
+
+            isUpdating = false;
+        }
+    }
+
+    // ==========================================
+    // ADDED: SUBLIST CHANGED
+    // Runs after a line is added, edited or removed.
+    // Refreshes the lines that were skipped while a line was being edited.
+    // ==========================================
+    function sublistChanged(context) {
+
+        if (isUpdating || !refreshPending) return;
+
+        if (context.sublistId !== 'item') return;
+
+        const rec = context.currentRecord;
+
+        // Still editing a line: wait, selecting another line could discard it
+        if (rec.getCurrentSublistValue({
+            sublistId: 'item',
+            fieldId: 'item'
+        })) return;
+
+        refreshPending = false;
+
+        log.debug('sublistChanged: refreshing added lines');
+
+        updateExistingItemLines(rec);
+    }
+
+    // ==========================================
     // PAGE INIT
     // ==========================================
     function pageInit(context) {
+
+        pageMode = context.mode;
 
         updateNetDaysField(
             context.currentRecord
@@ -417,6 +579,30 @@ define(['N/log'], (log) => {
             return;
         }
 
+        // Rate typed or sourced on the line: keep the amount preview in step
+        if (
+            context.sublistId === 'item' &&
+            context.fieldId === 'rate'
+        ) {
+
+            isUpdating = true;
+
+            try {
+
+                previewAmount(
+                    rec,
+                    rec.getValue({ fieldId: 'startdate' }),
+                    rec.getValue({ fieldId: 'enddate' })
+                );
+
+            } finally {
+
+                isUpdating = false;
+            }
+
+            return;
+        }
+
         if (
             !context.sublistId &&
             (
@@ -426,7 +612,7 @@ define(['N/log'], (log) => {
             )
         ) {
 
-            updateExistingItemLines(rec);
+            refreshLines(rec);
         }
     }
 
@@ -496,6 +682,7 @@ define(['N/log'], (log) => {
         pageInit,
         fieldChanged,
         postSourcing,
+        sublistChanged,
         validateLine
     };
 });
