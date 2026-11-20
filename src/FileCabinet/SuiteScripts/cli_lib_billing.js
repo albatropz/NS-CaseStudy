@@ -16,7 +16,7 @@
  *     is a balancing figure (master total minus running total), never computed.
  *  5. Works for one or many item lines (units). Each line has its own rate.
  */
-define(['N/error', 'N/log', 'N/record', 'N/runtime'], (error, log, record, runtime) => {
+define(['N/error', 'N/log', 'N/record', 'N/runtime', 'N/search'], (error, log, record, runtime, search) => {
 
     const BILL_TYPE = 'customrecord_cli_billing_schedule';
 
@@ -27,6 +27,15 @@ define(['N/error', 'N/log', 'N/record', 'N/runtime'], (error, log, record, runti
         '6': 3,   // Quarterly
         '4': 6,   // Semi-Annual
         '1': 12   // Annual
+    };
+
+    // Billing months -> accepted unit names (lower case). Matches unit name OR abbreviation.
+    // Same names as UNIT_MAPPING in cli_cs_contract_create.js
+    const UNIT_NAMES = {
+        1: ['month', 'mo'],
+        3: ['quarter', 'qrtr'],
+        6: ['semi-annual', 'smannl'],
+        12: ['year', 'yr']
     };
 
     // ==========================================
@@ -344,6 +353,93 @@ define(['N/error', 'N/log', 'N/record', 'N/runtime'], (error, log, record, runti
     };
 
     // ==========================================
+    // SET ITEM UNITS ON THE SERVER (beforeSubmit)
+    // The client script only previews units and depends on the order the user
+    // fills in the form. This makes the saved unit always match the Payment Terms.
+    // If a unit cannot be found it logs the available units and leaves the line
+    // unchanged, it never blocks the save.
+    // ==========================================
+
+    const getUnitsOfType = unitsTypeId => {
+        const rec = record.load({ type: 'unitstype', id: unitsTypeId });
+        const count = rec.getLineCount({ sublistId: 'uom' });
+        const list = [];
+
+        for (let i = 0; i < count; i++) {
+            list.push({
+                id: rec.getSublistValue({ sublistId: 'uom', fieldId: 'internalid', line: i }),
+                name: String(
+                    rec.getSublistValue({ sublistId: 'uom', fieldId: 'unitname', line: i }) || ''
+                ).trim().toLowerCase(),
+                abbr: String(
+                    rec.getSublistValue({ sublistId: 'uom', fieldId: 'abbreviation', line: i }) || ''
+                ).trim().toLowerCase()
+            });
+        }
+
+        return list;
+    };
+
+    const applyUnits = (so, billingMonths) => {
+        const wanted = UNIT_NAMES[billingMonths];
+        const lineCount = so.getLineCount({ sublistId: 'item' });
+        const typeCache = {};   // unit type id -> its units, so each type loads once
+
+        for (let i = 0; i < lineCount; i++) {
+            try {
+                const itemId = so.getSublistValue({ sublistId: 'item', fieldId: 'item', line: i });
+                if (!itemId) continue;
+
+                // Unit type of THIS line's item (each unit can have its own type)
+                const lookup = search.lookupFields({
+                    type: search.Type.ITEM,
+                    id: itemId,
+                    columns: ['unitstype']
+                });
+
+                const unitsTypeId =
+                    lookup.unitstype && lookup.unitstype[0] ? lookup.unitstype[0].value : null;
+
+                if (!unitsTypeId) {
+                    log.debug({ title: 'applyUnits: item has no unit type', details: { line: i, itemId } });
+                    continue;
+                }
+
+                if (!typeCache[unitsTypeId]) typeCache[unitsTypeId] = getUnitsOfType(unitsTypeId);
+
+                const match = typeCache[unitsTypeId].find(
+                    u => wanted.includes(u.name) || wanted.includes(u.abbr)
+                );
+
+                if (!match) {
+                    log.error({
+                        title: 'applyUnits: no matching unit',
+                        details: {
+                            line: i,
+                            itemId,
+                            unitsTypeId,
+                            wanted,
+                            available: typeCache[unitsTypeId].map(u => u.name + ' / ' + u.abbr)
+                        }
+                    });
+                    continue;
+                }
+
+                so.setSublistValue({ sublistId: 'item', fieldId: 'units', line: i, value: match.id });
+
+                log.debug({
+                    title: 'applyUnits: unit set',
+                    details: { line: i, itemId, unitId: match.id, unit: match.name }
+                });
+
+            } catch (e) {
+                // Units must never block saving the contract
+                log.error({ title: 'applyUnits failed on line ' + i, details: e });
+            }
+        }
+    };
+
+    // ==========================================
     // WRITE MASTER VALUES TO ITEM LINES (beforeSubmit)
     // ==========================================
 
@@ -353,6 +449,9 @@ define(['N/error', 'N/log', 'N/record', 'N/runtime'], (error, log, record, runti
         if (lineCount !== calc.lines.length) {
             fail('ITEM_LINE_MISMATCH', 'Item line count changed during calculation.');
         }
+
+        // Units first, so the quantity, rate and amount below are the final values
+        applyUnits(so, calc.billingMonths);
 
         calc.lines.forEach((line, i) => {
             so.setSublistValue({
