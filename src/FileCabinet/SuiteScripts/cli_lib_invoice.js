@@ -35,6 +35,15 @@ define([
     // The Suitelet filter hides every schedule that has a value here.
     const INVOICE_FIELD = 'custrecord_cli_bs_invoice';
 
+    // Sales Order statuses (the orderstatus field) that cannot be billed.
+    // Without this check NetSuite only says "You can not initialize invoice: invalid reference".
+    const SO_NOT_BILLABLE = {
+        A: 'is Pending Approval. Approve it first',
+        C: 'is Cancelled',
+        G: 'is already fully Billed',
+        H: 'is Closed'
+    };
+
     // Governance: stop starting new invoices when this little usage is left.
     // One invoice costs roughly 45 units (SO load, transform, save, link, lookups).
     const MIN_USAGE = 150;
@@ -44,7 +53,7 @@ define([
 
     // Select fields come back from lookupFields as [{ value, text }]
     const firstValue = field =>
-        Array.isArray(field) ? (field[0] ? field[0].value : '') : (field || '');
+        Array.isArray(field) ? (field[0] ? field[0].value : '') : (field ||'');
 
     // ==========================================
     // READ THE SCHEDULE RECORD
@@ -110,6 +119,15 @@ define([
             // The schedule record stores one amount per period (all items together).
             // The per-item split only exists in the math, so it is recalculated here.
             const so = record.load({ type: record.Type.SALES_ORDER, id: schedule.soId });
+
+            // Stop early with a clear message when the Sales Order cannot be billed
+            const soStatus = String(so.getValue({ fieldId: 'orderstatus' }));
+            log.debug({ title: 'Sales Order status', details: { soId: schedule.soId, orderstatus: soStatus } });
+
+            if (SO_NOT_BILLABLE[soStatus]) {
+                billing.fail('SO_NOT_BILLABLE',
+                    'Sales Order ' + schedule.soId + ' ' + SO_NOT_BILLABLE[soStatus] + '.');
+            }
 
             const billingMonths = billing.getBillingMonths(so.getValue({ fieldId: 'terms' }));
             const monthlyRates = billing.readMonthlyRates(so, billingMonths);

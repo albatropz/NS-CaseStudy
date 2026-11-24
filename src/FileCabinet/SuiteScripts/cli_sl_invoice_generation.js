@@ -160,6 +160,8 @@ define([
             ]
         });
 
+        
+        //10
         const paged = scheduleSearch.runPaged({ pageSize: MAX_ROWS });
         const total = paged.count;
         const rows = [];
